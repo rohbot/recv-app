@@ -12,6 +12,7 @@ public final class MonitorLog {
     public record Entry(String text, Instant time, ReceiverProtocol.Message parsed,
                         String device, boolean historical, boolean warning) {
         public boolean isEvent() { return parsed != null && parsed.event(); }
+        public boolean shouldAlert() { return isEvent() && !historical; }
     }
     private final ArrayDeque<Entry> entries = new ArrayDeque<>();
     private final EventDeduplicator deduplicator = new EventDeduplicator();

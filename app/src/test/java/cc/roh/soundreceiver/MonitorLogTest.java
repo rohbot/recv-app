@@ -13,6 +13,17 @@ public class MonitorLogTest {
         assertNull(log.receive("A", BleFixtures.event(1,42), false, NOW));
         assertEquals(1, log.totalLines);
     }
+    @Test public void alertsOnlyForUniqueNewDetectionsAcrossReadsAndNotifications() {
+        MonitorLog log = new MonitorLog();
+        assertFalse(log.receive("A", BleFixtures.sentinel(1), true, NOW).shouldAlert());
+        assertFalse(log.receive("B", BleFixtures.event(1, 10), true, NOW).shouldAlert());
+        assertTrue(log.receive("A", BleFixtures.event(1, 1), false, NOW).shouldAlert());
+        assertNull(log.receive("A", BleFixtures.event(1, 1), true, NOW));
+        assertTrue(log.receive("A", BleFixtures.event(1, 3), true, NOW).shouldAlert());
+        assertFalse(log.receive("A", new byte[0], false, NOW).shouldAlert());
+        log.clear();
+        assertNull(log.receive("A", BleFixtures.event(1, 3), false, NOW));
+    }
     @Test public void retainedLogIsBoundedButReceivedCountIsNotDeviceCounter() {
         MonitorLog log = new MonitorLog();
         for (int i=100; i<1200; i++) log.receive("A", BleFixtures.event(1,i), false,NOW);

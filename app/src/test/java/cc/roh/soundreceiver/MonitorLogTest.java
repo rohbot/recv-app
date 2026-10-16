@@ -6,56 +6,53 @@ import static org.junit.Assert.*;
 
 public class MonitorLogTest {
     private static final Instant NOW = Instant.parse("2026-10-16T10:20:30Z");
-
-    @Test public void retainsOnlyLatestThousandButCountsAllEvents() {
+    @Test public void historicalReadUpdatesCardsWithoutCountingAsNew() {
         MonitorLog log = new MonitorLog();
-        for (int i = 0; i < 1100; i++) log.receive(ReceiverProtocolTest.EVENT, NOW);
-        assertEquals(1100, log.totalLines);
-        assertEquals(1100, log.eventCount);
-        assertEquals(1000, log.visible(false).size());
-        assertEquals(NOW, log.latestEventTime);
+        assertTrue(log.receive("A", BleFixtures.event(1,42), true, NOW).historical());
+        assertEquals(0, log.eventCount); assertEquals(42, log.latest.sequence());
+        assertNull(log.receive("A", BleFixtures.event(1,42), false, NOW));
+        assertEquals(1, log.totalLines);
     }
-
-    @Test public void filteringAndExportKeepRawLinesAndTimestamps() {
+    @Test public void retainedLogIsBoundedButReceivedCountIsNotDeviceCounter() {
         MonitorLog log = new MonitorLog();
-        log.receive("boot", NOW);
-        log.receive("ESP-NOW receiver aa:bb:cc:dd:ee:ff, channel 1", NOW);
-        log.receive(ReceiverProtocolTest.EVENT, NOW);
-        assertEquals(1, log.visible(true).size());
-        assertEquals(3, log.visible(false).size());
-        assertEquals(1, log.eventCount);
-        assertTrue(log.export().startsWith("2026-10-16T10:20:30Z\tboot\n"));
-        assertTrue(log.export().contains(ReceiverProtocolTest.EVENT));
+        for (int i=100; i<1200; i++) log.receive("A", BleFixtures.event(1,i), false,NOW);
+        assertEquals(1100, log.eventCount); assertEquals(1100, log.totalLines); assertEquals(1000, log.visible(false).size());
+        assertEquals(1199, log.latest.sequence());
     }
-
-    @Test public void reconnectResetsSummaryAndRetainsPreviousLogs() {
+    @Test public void noEventSentinelDoesNotPopulateCardsOrCount() {
         MonitorLog log = new MonitorLog();
-        log.receive(ReceiverProtocolTest.EVENT, NOW);
-        log.resetSummary();
-        assertEquals(0, log.eventCount);
-        assertNull(log.latest);
-        assertEquals(1, log.visible(false).size());
-        log.receive(ReceiverProtocolTest.EVENT, NOW.plusSeconds(1));
-        assertEquals(1, log.eventCount);
-        assertEquals(2, log.totalLines);
+        log.receive("A", BleFixtures.sentinel(0), true,NOW);
+        assertNull(log.latest); assertEquals(0, log.eventCount); assertEquals(0, log.visible(true).size());
     }
-
-    @Test public void clearResetsAllData() {
+    @Test public void filteringExportAndClearPreserveDeduplication() {
         MonitorLog log = new MonitorLog();
-        log.receive(ReceiverProtocolTest.EVENT, NOW);
-        log.clear();
-        assertTrue(log.isEmpty());
-        assertEquals(0, log.totalLines);
-        assertEquals(0, log.eventCount);
-        assertNull(log.latest);
-        assertNull(log.last);
-        assertEquals("", log.export());
+        log.status("connected",NOW,false);
+        log.receive("A", BleFixtures.event(1,1),false,NOW);
+        assertEquals(1, log.visible(true).size()); assertEquals(2, log.visible(false).size());
+        assertTrue(log.export().startsWith("2026-10-16T10:20:30Z\tconnected\n"));
+        assertTrue(log.export().contains("source=notification")); assertTrue(log.export().contains("raw=0101"));
+        log.clear(); assertTrue(log.isEmpty()); assertEquals(0,log.eventCount); assertNull(log.latest);
+        assertNull(log.receive("A", BleFixtures.event(1,1),true,NOW));
+        assertEquals(0,log.eventCount);
     }
-
-    @Test public void evictionRemovesOldestRawLine() {
+    @Test public void malformedPayloadDoesNotKillSubsequentEvents() {
         MonitorLog log = new MonitorLog();
-        for (int i = 0; i < 1001; i++) log.receive("line " + i, NOW);
-        assertEquals("line 1", log.visible(false).get(0).text());
-        assertFalse(log.export().contains("\tline 0\n"));
+        byte[] unknown = BleFixtures.event(1,1); unknown[0] = 2;
+        assertTrue(log.receive("A",unknown,false,NOW).warning());
+        log.receive("A",BleFixtures.event(1,2),false,NOW);
+        assertEquals(1,log.eventCount); assertEquals(2,log.totalLines);
+    }
+    @Test public void uptimeWrapDoesNotAffectOrderingOrReceiptTime() {
+        MonitorLog log = new MonitorLog();
+        log.receive("A",BleFixtures.value(1,1,1,0xffffffffL,65535,-4000,-6000),false,NOW);
+        log.receive("A",BleFixtures.value(1,1,2,1,64,-4000,-6000),false,NOW.plusSeconds(1));
+        assertEquals(2,log.eventCount); assertEquals(1,log.latest.uptime()); assertEquals(NOW.plusSeconds(1),log.latestEventTime);
+        assertTrue(log.export().contains("duration=65535+ ms"));
+    }
+    @Test public void missingEventsReportedSeparatelyFromDeliveredCount() {
+        MonitorLog log = new MonitorLog();
+        log.receive("A",BleFixtures.event(1,1),false,NOW);
+        log.receive("A",BleFixtures.event(1,5),false,NOW);
+        assertEquals(2,log.eventCount); assertEquals(3,log.missedCount);
     }
 }

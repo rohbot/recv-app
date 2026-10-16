@@ -1,42 +1,43 @@
 package cc.roh.soundreceiver;
 
-import java.util.Locale;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.UUID;
 
-/** The wire format emitted by LilyGo-Cam-ESP32S3/examples/SoundEventReceiver. */
+/** SoundMeter BLE protocol v1. See BLE_PROTOCOL.md. No text framing or MTU negotiation. */
 public final class ReceiverProtocol {
-    private static final String MAC = "([\\da-f]{2}(?::[\\da-f]{2}){5})";
-    private static final String NUMBER = "(-?\\d+(?:\\.\\d+)?)";
-    private static final Pattern STATUS = Pattern.compile("^ESP-NOW receiver " + MAC + ", channel (\\d+)$", Pattern.CASE_INSENSITIVE);
-    private static final Pattern EVENT = Pattern.compile("^SOUND EVENT from " + MAC + " #(\\d+) level=" + NUMBER
-            + " dBFS floor=" + NUMBER + " dBFS rise=" + NUMBER
-            + " dB duration=(\\d+) ms uptime=(\\d+) ms$", Pattern.CASE_INSENSITIVE);
-    private static final Pattern WARNING = Pattern.compile("failed|error|invalid|panic|^E \\(", Pattern.CASE_INSENSITIVE);
-
-    public record Message(boolean event, String mac, long channel, long sequence,
-                          double level, double floor, double rise, long duration, long uptime) {}
-
-    public static Message parse(String line) {
-        try {
-            Matcher status = STATUS.matcher(line);
-            if (status.matches()) return new Message(false, status.group(1).toUpperCase(Locale.ROOT),
-                    Long.parseLong(status.group(2)), 0, 0, 0, 0, 0, 0);
-            Matcher event = EVENT.matcher(line);
-            if (!event.matches()) return null;
-            double level = Double.parseDouble(event.group(3));
-            double floor = Double.parseDouble(event.group(4));
-            double rise = Double.parseDouble(event.group(5));
-            if (!Double.isFinite(level) || !Double.isFinite(floor) || !Double.isFinite(rise)) return null;
-            return new Message(true, event.group(1).toUpperCase(Locale.ROOT), 0,
-                    Long.parseLong(event.group(2)), level, floor, rise,
-                    Long.parseLong(event.group(6)), Long.parseLong(event.group(7)));
-        } catch (NumberFormatException ignored) {
-            // Noisy/overflowing serial input remains a plain log message.
-            return null;
-        }
+    public static final UUID SERVICE = UUID.fromString("9e7a0001-4f3b-4d61-9c8a-2b6f0e5d7100");
+    public static final UUID EVENT = UUID.fromString("9e7a0002-4f3b-4d61-9c8a-2b6f0e5d7100");
+    public static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+    public record Message(int type, int duration, long bootId, long sequence, long uptime,
+                          double level, double floor) {
+        public boolean event() { return type == 1; }
+        public double rise() { return level - floor; }
     }
 
-    public static boolean isWarning(String line) { return WARNING.matcher(line).find(); }
+    public static Message decode(byte[] value) {
+        if (value == null || value.length != 20) throw new IllegalArgumentException("Invalid event length: expected 20 bytes");
+        ByteBuffer data = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
+        int version = Byte.toUnsignedInt(data.get());
+        int type = Byte.toUnsignedInt(data.get());
+        if (version != 1 || (type != 0 && type != 1))
+            throw new IllegalArgumentException("Unsupported protocol: version " + version + ", type " + type);
+        int duration = Short.toUnsignedInt(data.getShort());
+        long boot = Integer.toUnsignedLong(data.getInt());
+        long sequence = Integer.toUnsignedLong(data.getInt());
+        long uptime = Integer.toUnsignedLong(data.getInt());
+        int level = data.getShort();
+        int floor = data.getShort();
+        if ((type == 0) != (sequence == 0) || level < -12000 || level > 0 || floor < -12000 || floor > 0)
+            throw new IllegalArgumentException("Invalid event fields");
+        return new Message(type, duration, boot, sequence, uptime, level / 100.0, floor / 100.0);
+    }
+
+    public static String hex(byte[] value) {
+        if (value == null) return "null";
+        StringBuilder result = new StringBuilder();
+        for (byte b : value) result.append(String.format(java.util.Locale.ROOT, "%02x", b & 255));
+        return result.toString();
+    }
     private ReceiverProtocol() {}
 }

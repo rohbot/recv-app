@@ -22,10 +22,21 @@ import org.junit.Rule;
 import org.junit.Test;
 import static org.junit.Assert.*;
 
-/** Exercises the actual Android UI with protocol fixtures; does not emulate USB hardware. */
+/** Exercises the actual Android UI with protocol fixtures; does not emulate BLE radio hardware. */
 public class MonitorActivityTest {
     @Rule public ActivityTestRule<MainActivity> activity = new ActivityTestRule<>(MainActivity.class);
-    private static final String EVENT = "SOUND EVENT from AA:BB:CC:DD:EE:FF #42 level=-23.4 dBFS floor=-60.1 dBFS rise=36.7 dB duration=80 ms uptime=123456 ms";
+    private static final String DEVICE = "AA:BB:CC:DD:EE:FF";
+    private static byte[] event(long sequence) {
+        return java.nio.ByteBuffer.allocate(20).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .put((byte)1).put((byte)1).putShort((short)64).putInt(0x12345678)
+                .putInt((int)sequence).putInt(10000).putShort((short)-4000).putShort((short)-6000).array();
+    }
+    private static byte[] sentinel() {
+        byte[] value = event(0); value[1] = 0;
+        value[16] = 0x20; value[17] = (byte)0xd1;
+        value[18] = 0x20; value[19] = (byte)0xd1;
+        return value;
+    }
 
     @SuppressWarnings("unchecked")
     private <T> T field(String name) {
@@ -38,7 +49,7 @@ public class MonitorActivityTest {
 
     private void ui(Runnable action) { InstrumentationRegistry.getInstrumentation().runOnMainSync(action); }
     private void render() {
-        // Production rendering batches incoming serial lines over 50 ms.
+        // Production rendering batches incoming BLE values over 50 ms.
         android.os.SystemClock.sleep(100);
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
@@ -46,10 +57,10 @@ public class MonitorActivityTest {
     private void feed() {
         ui(() -> {
             this.<CheckBox>field("beepEnabled").setChecked(false);
-            activity.getActivity().onLines(List.of(
-                    new UsbConnection.WireLine("ESP-NOW receiver 01:23:45:67:89:AB, channel 6", Instant.now()),
-                    new UsbConnection.WireLine("boot message", Instant.now()),
-                    new UsbConnection.WireLine(EVENT, Instant.now())));
+            activity.getActivity().onOpened(DEVICE);
+            activity.getActivity().onValue(DEVICE, sentinel(), true);
+            activity.getActivity().onValue(DEVICE, event(1), false);
+            activity.getActivity().onValue(DEVICE, event(1), true);
         });
         render();
     }
@@ -58,13 +69,13 @@ public class MonitorActivityTest {
         feed();
         ui(() -> {
             assertEquals("1", label("count"));
-            assertTrue(label("level").contains("23.4"));
-            assertTrue(label("floor").contains("60.1"));
-            assertTrue(label("rise").contains("+36.7"));
-            assertTrue(label("latest").contains("#42 from AA:BB:CC:DD:EE:FF"));
-            assertTrue(label("duration").contains("80 ms confirmation"));
-            assertEquals("01:23:45:67:89:AB · CH 6", label("identity"));
-            assertEquals(3, this.<ListView>field("terminal").getCount());
+            assertTrue(label("level").contains("40.0"));
+            assertTrue(label("floor").contains("60.0"));
+            assertTrue(label("rise").contains("+20.0"));
+            assertTrue(label("latest").contains("#1 · AA:BB:CC:DD:EE:FF"));
+            assertTrue(label("duration").contains("64 ms confirmation"));
+            assertEquals("SoundMeter · " + DEVICE, label("identity"));
+            assertEquals(2, this.<ListView>field("terminal").getCount());
             assertTrue(this.<Button>field("save").isEnabled());
         });
     }
@@ -75,7 +86,7 @@ public class MonitorActivityTest {
         render();
         ui(() -> {
             assertEquals(1, this.<ListView>field("terminal").getCount());
-            assertTrue(this.<MonitorLog>field("log").export().contains("boot message"));
+            assertTrue(this.<MonitorLog>field("log").export().contains("No event yet"));
             this.<Button>field("clear").performClick();
         });
         render();
@@ -87,13 +98,36 @@ public class MonitorActivityTest {
         });
     }
 
-    @Test public void noDeviceShowsActionableMessageAndAllowsRetry() {
+    @Test public void historicalSnapshotDoesNotCountAndUnsupportedPacketKeepsHandlerAlive() {
         ui(() -> {
-            this.<Button>field("connect").performClick();
-            assertTrue(label("notice").contains("No USB device detected"));
-            assertTrue(this.<Button>field("connect").isEnabled());
-            assertFalse(this.<Button>field("disconnect").isEnabled());
+            this.<CheckBox>field("beepEnabled").setChecked(false);
+            activity.getActivity().onValue(DEVICE, event(10), true);
         });
+        render();
+        ui(() -> {
+            assertEquals("0", label("count"));
+            assertTrue(label("latest").contains("Historical"));
+            byte[] bad = event(11); bad[0] = 2;
+            activity.getActivity().onValue(DEVICE, bad, false);
+            assertTrue(label("notice").contains("Unsupported protocol"));
+            activity.getActivity().onValue(DEVICE, event(11), false);
+        });
+        render();
+        ui(() -> assertEquals("1", label("count")));
+    }
+
+    @Test public void reconnectReadDoesNotReplayNotificationAndQuietStateIsIndependent() {
+        feed();
+        ui(() -> {
+            activity.getActivity().onState("BLE disconnected · reconnecting in 1 s");
+            assertTrue(label("state").contains("reconnecting"));
+            activity.getActivity().onOpened(DEVICE);
+            activity.getActivity().onValue(DEVICE, event(1), true);
+            assertTrue(label("state").contains("Connected"));
+            assertTrue(label("notice").contains("quiet periods are normal"));
+        });
+        render();
+        ui(() -> assertEquals("1", label("count")));
     }
 
     @Test public void rotationPreservesSessionAndControls() {
@@ -113,7 +147,7 @@ public class MonitorActivityTest {
                     before.getResources().getConfiguration().orientation);
             assertEquals("1", label("count"));
             assertFalse(this.<CheckBox>field("autoScroll").isChecked());
-            assertEquals(3, this.<ListView>field("terminal").getCount());
+            assertEquals(2, this.<ListView>field("terminal").getCount());
             before.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         });
     }
@@ -139,9 +173,9 @@ public class MonitorActivityTest {
                 android.os.SystemClock.sleep(50);
             assertTrue("Export should create a document", file.exists());
             String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
-            assertTrue(content.contains("\tboot message\n"));
-            assertTrue(content.contains("\t" + EVENT + "\n"));
-            assertEquals(3, content.split("\n").length);
+            assertTrue(content.contains("No event yet"));
+            assertTrue(content.contains("SOUND EVENT device=" + DEVICE));
+            assertEquals(2, content.split("\n").length);
         } finally {
             instrumentation.removeMonitor(monitor);
             file.delete();

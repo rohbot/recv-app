@@ -2,7 +2,12 @@ package cc.roh.soundreceiver;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.PendingIntent;
+import android.Manifest;
+import android.annotation.SuppressLint;
+import android.bluetooth.BluetoothAdapter;
+import android.content.pm.PackageManager;
+import android.location.LocationManager;
+import android.widget.ArrayAdapter;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -10,8 +15,6 @@ import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -29,37 +32,33 @@ import android.widget.ListView;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import androidx.core.content.ContextCompat;
-import com.hoho.android.usbserial.driver.UsbSerialDriver;
-import com.hoho.android.usbserial.driver.UsbSerialPort;
-import com.hoho.android.usbserial.driver.UsbSerialProber;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public final class MainActivity extends Activity implements UsbConnection.Listener {
+public final class MainActivity extends Activity implements BleConnection.Listener {
     private static final int BG = 0xff101a23, PANEL = 0xff172630, TEXT = 0xffedf4f5,
             MUTED = 0xffa0b4c1, TEAL = 0xff62dcc5, ORANGE = 0xffffbd8a;
     private static final int EXPORT = 40;
-    private static final String USB_PERMISSION = "cc.roh.soundreceiver.USB_PERMISSION";
+    private static final int BLE_PERMISSIONS = 41, ENABLE_BLUETOOTH = 42;
     private final MonitorLog log = new MonitorLog();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService files = Executors.newSingleThreadExecutor();
     private final EventTone tone = new EventTone();
     private final DateTimeFormatter clock = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
-    private UsbManager usb;
-    private UsbConnection connection;
-    private UsbSerialPort pendingPort;
-    private PendingIntent permissionIntent;
+    private BleConnection connection;
     private AlertDialog picker;
-    private int permissionRequest;
+    private ArrayAdapter<String> deviceAdapter;
+    private List<BleConnection.Peripheral> peripherals = new ArrayList<>();
+    private String phase = "Disconnected";
+    private boolean foreground, enablingBluetooth;
     private boolean waitingPermission, connected, closing, exporting, destroyed, renderPending;
     private String exportSnapshot;
     private TextView state, identity, notice, count, level, floor, rise, latest, duration, lineCount, lastMessage, empty, audioStatus;
@@ -70,42 +69,23 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (USB_PERMISSION.equals(action) && waitingPermission && pendingPort != null) {
-                // Check actual permission rather than trusting a broadcast's grant extra.
-                UsbSerialPort port = pendingPort;
-                waitingPermission = false;
-                pendingPort = null;
-                cancelPermissionIntent();
-                if (usb.hasPermission(port.getDevice())) open(port);
-                else {
-                    notice.setText("USB permission denied. Tap Connect receiver to try again.");
-                    updateState();
-                }
-            } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
-                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
-                if (device == null) return;
-                if (connection.device() != null && connection.device().equals(device))
-                    disconnect("Receiver removed. Reconnect the USB cable, then tap Connect receiver.");
-                if (pendingPort != null && pendingPort.getDevice().equals(device)) {
-                    cancelPermission();
-                    notice.setText("Receiver removed before connecting. Reconnect and try again.");
-                }
-            }
+            if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(intent.getAction())
+                    && intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) == BluetoothAdapter.STATE_OFF)
+                connection.close("Bluetooth is off. Turn it on and tap Connect SoundMeter.");
         }
     };
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        usb = (UsbManager) getSystemService(USB_SERVICE);
-        connection = new UsbConnection(usb, this);
+        connection = new BleConnection(this, this);
         buildUi();
-        IntentFilter filter = new IntentFilter(USB_PERMISSION);
-        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
-        ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
+        ContextCompat.registerReceiver(this, receiver, new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                ContextCompat.RECEIVER_NOT_EXPORTED);
         updateState();
         render();
     }
+
+    @Override protected void onStart() { super.onStart(); foreground = true; }
 
     private void buildUi() {
         ScrollView page = new ScrollView(this);
@@ -128,26 +108,26 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         TextView brand = text("▂▆█▄▂   SOUND EVENT / RECEIVER", 13, TEAL);
         brand.setTypeface(null, Typeface.BOLD);
         body.addView(brand);
-        addText(body, "ESP32-S3 · ESP-NOW · USB SERIAL", 11, MUTED, 20);
+        addText(body, "ESP32-S3 · BLUETOOTH LOW ENERGY", 11, MUTED, 20);
         TextView title = addText(body, "Listen to what’s\nhappening.", 32, TEXT, 8);
         title.setTypeface(null, Typeface.BOLD);
-        addText(body, "Connect your USB receiver to view sound events and serial messages.", 15, MUTED, 8);
+        addText(body, "Connect your SoundMeter wirelessly to view confirmed sound events.", 15, MUTED, 8);
         LinearLayout controls = row();
-        connect = button("Connect receiver", true, v -> choosePort());
+        connect = button("Connect SoundMeter", true, v -> connectBle());
         disconnect = button("Disconnect", false, v -> disconnect("Disconnected. Retained messages are kept until you clear or close the app."));
         controls.addView(connect, weight(2));
         controls.addView(disconnect, weight(1));
         add(body, controls, 18);
 
-        state = addText(body, "Disconnected  ·  115200 baud · 8N1", 13, TEAL, 12);
+        state = addText(body, "Disconnected · BLE", 13, TEAL, 12);
         state.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        identity = addText(body, "No receiver connected", 12, MUTED, 6);
+        identity = addText(body, "No SoundMeter connected", 12, MUTED, 6);
         identity.setTextIsSelectable(true);
-        notice = addText(body, "Ready to connect. Use a USB data cable or OTG adapter and close other serial monitors.", 13, MUTED, 10);
+        notice = addText(body, "Ready to connect. Power your SoundMeter and allow Bluetooth access when asked.", 13, MUTED, 10);
         notice.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
 
         LinearLayout first = row();
-        TextView[] events = metric(first, "EVENTS RECEIVED", "0", "Waiting for the first event", false);
+        TextView[] events = metric(first, "NEW EVENTS RECEIVED", "0", "Waiting for the first event", false);
         count = events[0]; latest = events[1];
         TextView[] sound = metric(first, "LATEST SOUND LEVEL", "— dBFS", "RMS level at detection", false);
         level = sound[0];
@@ -162,7 +142,7 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         LinearLayout panel = column();
         panel.setPadding(dp(12), dp(14), dp(12), dp(12));
         panel.setBackground(shape(PANEL, 12));
-        TextView stream = text(">_  Serial stream", 18, TEXT);
+        TextView stream = text(">_  Event stream", 18, TEXT);
         stream.setTypeface(null, Typeface.BOLD);
         panel.addView(stream);
         lineCount = addText(panel, "0 lines", 12, MUTED, 5);
@@ -186,7 +166,7 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         audio.addView(button("Test beep", false, v -> playTone()), weight(1));
         panel.addView(audio);
         audioStatus = addText(panel, "Event beeps ready · uses media volume", 12, MUTED, 0);
-        empty = addText(panel, "Ready when you are. Connect your receiver by USB.", 14, MUTED, 12);
+        empty = addText(panel, "Ready when you are. Connect your SoundMeter over Bluetooth.", 14, MUTED, 12);
         empty.setPadding(dp(8), dp(16), dp(8), dp(16));
         terminal = new ListView(this);
         terminal.setBackgroundColor(0xff0c151c);
@@ -203,9 +183,9 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         lastMessage = addText(panel, "No data yet", 11, MUTED, 10);
         add(body, panel, 20);
         addText(body, "Getting connected", 15, TEXT, 20);
-        addText(body, "Use an Android device with USB host / OTG support. Connect the receiver with a data cable, tap Connect receiver, select its serial port, then allow USB access. Power the T-Camera sender, wait five seconds for noise learning, then make a loud sound.", 13, MUTED, 8);
-        addText(body, "Cards show event measurements, not continuous microphone telemetry. The receiver identifies itself every five seconds. Monitoring keeps the screen awake; leaving the app disconnects USB. Rotation keeps your session.", 13, MUTED, 8);
-        addText(body, "LOCAL ONLY · Latest 1,000 lines kept in memory. No network access or automatic storage. Download log saves to a location you choose. Closing the app clears the session.", 12, MUTED, 12);
+        addText(body, "Power a board running the SoundMeter BLE firmware. Tap Connect SoundMeter, allow Nearby devices access, then select your board. Wait five seconds for noise learning, then make a loud sound. Only one client can connect at a time.", 13, MUTED, 8);
+        addText(body, "Quiet is normal: there is no heartbeat or continuous audio stream. The first latest-event snapshot is historical and does not beep. Monitoring keeps the screen awake; leaving the app disconnects BLE. Rotation keeps your session.", 13, MUTED, 8);
+        addText(body, "LOCAL ONLY · Latest 1,000 log entries kept in memory. No internet access or automatic storage. Download log saves to a location you choose. Session data is lost when the app is destroyed.", 12, MUTED, 12);
         add(body, button("Open-source licenses", false, v -> showLicenses()), 12);
     }
 
@@ -220,102 +200,134 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         } catch (java.io.IOException error) { notice.setText("Could not read license notices."); }
     }
 
-    private void choosePort() {
-        if (connection.isBusy() || waitingPermission) return;
-        List<UsbSerialPort> ports = new ArrayList<>();
+    private String[] requiredPermissions() {
+        return Build.VERSION.SDK_INT >= 31
+                ? new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT}
+                : new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+    }
+
+    private boolean hasBlePermissions() {
+        for (String permission : requiredPermissions())
+            if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) return false;
+        return true;
+    }
+
+    @SuppressLint("MissingPermission")
+    private void connectBle() {
+        if (connection.isBusy() || waitingPermission || enablingBluetooth) return;
+        if (!connection.supported()) { notice.setText("Bluetooth LE is unavailable on this device."); return; }
+        if (!hasBlePermissions()) {
+            waitingPermission = true;
+            notice.setText(Build.VERSION.SDK_INT >= 31 ? "Allow Nearby devices access to scan and connect."
+                    : "Android 8–11 requires Location permission for Bluetooth scanning.");
+            updateState();
+            requestPermissions(requiredPermissions(), BLE_PERMISSIONS);
+            return;
+        }
         try {
-            List<UsbSerialDriver> drivers = UsbSerialProber.getDefaultProber().findAllDrivers(usb);
-            drivers.sort(Comparator.comparing(d -> d.getDevice().getDeviceName()));
-            for (UsbSerialDriver driver : drivers) ports.addAll(driver.getPorts());
+            if (!connection.enabled()) {
+                enablingBluetooth = true;
+                updateState();
+                startActivityForResult(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), ENABLE_BLUETOOTH);
+                return;
+            }
+            if (Build.VERSION.SDK_INT < 31) {
+                LocationManager location = (LocationManager) getSystemService(LOCATION_SERVICE);
+                if (location == null || (!location.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                        && !location.isProviderEnabled(LocationManager.NETWORK_PROVIDER))) {
+                    notice.setText("Turn on Android Location services for BLE scanning on Android 8–11, then try again.");
+                    return;
+                }
+            }
+            deviceAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1);
+            peripherals.clear();
+            picker = new AlertDialog.Builder(this).setTitle("Searching for SoundMeter…")
+                    .setAdapter(deviceAdapter, (dialog, which) -> {
+                        BleConnection.Peripheral device = peripherals.get(which);
+                        // Clear the reference before open: programmatic dismiss must not cancel a selected device.
+                        picker = null;
+                        identity.setText(device.name() + " · " + device.id());
+                        connection.open(device);
+                    }).setNegativeButton("Cancel", (dialog, which) -> connection.close("Scan cancelled."))
+                    .setOnCancelListener(dialog -> connection.close("Scan cancelled.")).create();
+            picker.show();
+            connection.scan();
         } catch (RuntimeException error) {
-            notice.setText("Could not inspect USB devices: " + error.getMessage());
-            return;
+            enablingBluetooth = false;
+            connection.close("Could not start Bluetooth: " + error.getMessage());
         }
-        if (ports.isEmpty()) {
-            notice.setText(usb.getDeviceList().isEmpty()
-                    ? "No USB device detected. Check the OTG adapter, data cable, and receiver power, then try again."
-                    : "No supported serial port found. Use a CDC/ACM, CP210x, CH34x, FTDI, or supported Prolific receiver.");
-            return;
-        }
-        String[] labels = new String[ports.size()];
-        for (int i = 0; i < ports.size(); i++) {
-            UsbSerialPort port = ports.get(i);
-            UsbDevice d = port.getDevice();
-            String name = d.getProductName();
-            labels[i] = (name == null ? "USB serial device" : name) + String.format(Locale.ROOT,
-                    "\n%04X:%04X · port %d · %s", d.getVendorId(), d.getProductId(), port.getPortNumber(), d.getDeviceName());
-        }
-        picker = new AlertDialog.Builder(this).setTitle("Choose receiver serial port")
-                .setItems(labels, (dialog, which) -> requestPort(ports.get(which)))
-                .setNegativeButton("Cancel", null).show();
     }
 
-    private void requestPort(UsbSerialPort port) {
-        if (usb.hasPermission(port.getDevice())) { open(port); return; }
-        pendingPort = port;
-        waitingPermission = true;
-        permissionIntent = PendingIntent.getBroadcast(this, ++permissionRequest,
-                new Intent(USB_PERMISSION).setPackage(getPackageName()), PendingIntent.FLAG_IMMUTABLE);
-        notice.setText("Allow USB access in the Android permission dialog.");
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request != BLE_PERMISSIONS) return;
+        boolean requested = waitingPermission;
+        waitingPermission = false;
         updateState();
-        try { usb.requestPermission(port.getDevice(), permissionIntent); }
-        catch (RuntimeException error) {
-            cancelPermission();
-            notice.setText("Could not request USB access: " + error.getMessage());
-        }
+        if (hasBlePermissions()) { if (requested && foreground) connectBle(); }
+        else notice.setText("Bluetooth permission denied. Tap Connect SoundMeter to retry, or allow access in Android app settings.");
     }
 
-    private void open(UsbSerialPort port) {
-        closing = false;
-        identity.setText("Waiting for receiver identity…");
-        notice.setText("Opening USB serial port…");
-        connection.open(port);
+    @Override public void onDevices(List<BleConnection.Peripheral> devices) {
+        if (picker == null) return;
+        peripherals = devices;
+        deviceAdapter.clear();
+        for (BleConnection.Peripheral device : devices) deviceAdapter.add(device.label());
+        picker.setTitle("Choose SoundMeter");
+    }
+
+    @Override public void onState(String value) {
+        phase = value;
+        connected = false;
+        notice.setText(value);
+        if (picker != null && value.startsWith("Scan finished")) picker.setTitle("Choose SoundMeter · scan finished");
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         updateState();
     }
 
-    @Override public void onOpened() {
-        if (closing) return;
+    @Override public void onOpened(String device) {
         connected = true;
-        log.resetSummary();
-        notice.setText("Connected at 115200 baud. Waiting for receiver messages.");
+        phase = "Connected · subscribed";
+        identity.setText("SoundMeter · " + device);
+        notice.setText("Notifications enabled. Reading latest snapshot; quiet periods are normal.");
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         updateState();
         scheduleRender();
     }
 
-    @Override public void onLines(List<UsbConnection.WireLine> lines) {
-        for (UsbConnection.WireLine line : lines) {
-            MonitorLog.Entry entry = log.receive(line.text(), line.time());
-            if (entry.parsed() != null && !entry.isEvent() && !closing)
-                identity.setText(entry.parsed().mac() + " · CH " + entry.parsed().channel());
-            if (entry.isEvent() && beepEnabled.isChecked() && !closing) playTone();
+    @Override public void onValue(String device, byte[] bytes, boolean read) {
+        MonitorLog.Entry entry = log.receive(device, bytes, read, Instant.now());
+        if (entry == null) {
+            if (read && connected) notice.setText("Connected and subscribed. Snapshot already seen; quiet periods are normal.");
+            return;
         }
-        if (connected && !closing) notice.setText("Receiving serial messages. Cards update when a sound alert arrives.");
+        if (entry.warning()) notice.setText(entry.text());
+        else if (entry.isEvent()) {
+            if (!entry.historical() && beepEnabled.isChecked()) playTone();
+            notice.setText(entry.historical() ? "Showing the board’s retained latest event, not a new alert."
+                    : "Sound event received. Quiet periods are normal. Estimated missed detections: " + log.missedCount);
+        } else notice.setText("Connected and subscribed. No event yet; quiet periods are normal.");
         scheduleRender();
     }
 
     @Override public void onClosed(String reason) {
         connected = closing = false;
-        identity.setText("No receiver connected");
+        phase = "Disconnected";
+        if (picker != null) { picker.dismiss(); picker = null; }
+        identity.setText("No SoundMeter connected");
         notice.setText(reason);
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         updateState();
         scheduleRender();
     }
 
-    private void disconnect(String reason) {
-        if (!connection.isBusy()) return;
-        closing = true;
-        connection.close(reason);
-        updateState();
-    }
+    private void disconnect(String reason) { connection.close(reason); }
 
     private void updateState() {
-        String label = closing ? "Disconnecting…" : connected ? "Connected" : connection.isBusy()
-                ? "Connecting…" : waitingPermission ? "Waiting for USB permission…" : "Disconnected";
-        state.setText(label + "  ·  115200 baud · 8N1");
-        connect.setEnabled(!connection.isBusy() && !waitingPermission);
-        disconnect.setEnabled(connected && !closing);
+        String label = waitingPermission ? "Waiting for Bluetooth permission…" : enablingBluetooth ? "Enable Bluetooth…" : phase;
+        state.setText(label + " · BLE");
+        connect.setEnabled(!connection.isBusy() && !waitingPermission && !enablingBluetooth);
+        disconnect.setEnabled(connection.isBusy());
     }
 
     private void scheduleRender() {
@@ -330,8 +342,8 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         level.setText(event == null ? "— dBFS" : String.format(Locale.getDefault(), "%.1f dBFS", event.level()));
         floor.setText(event == null ? "— dBFS" : String.format(Locale.getDefault(), "%.1f dBFS", event.floor()));
         rise.setText(event == null ? "— dB" : String.format(Locale.getDefault(), "%+.1f dB", event.rise()));
-        latest.setText(event == null ? "Waiting for the first event" : "#" + event.sequence() + " from " + event.mac());
-        duration.setText(event == null ? "No event received yet" : event.duration() + " ms confirmation · " + clock.format(log.latestEventTime));
+        latest.setText(event == null ? "Waiting for the first event" : (log.latestHistorical ? "Historical · " : "") + "#" + event.sequence() + " · " + log.latestDevice + " · boot " + event.bootId());
+        duration.setText(event == null ? "No event received yet" : event.duration() + (event.duration() == 65535 ? "+" : "") + " ms confirmation · " + clock.format(log.latestEventTime));
         lineCount.setText(log.totalLines + " lines" + (log.totalLines > MonitorLog.MAX_LINES ? " · 1,000 retained" : ""));
         lastMessage.setText(log.last == null ? "No data yet" : "Last message " + clock.format(log.last.time()));
         save.setEnabled(!log.isEmpty() && !exporting);
@@ -343,7 +355,7 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         adapter.notifyDataSetChanged();
         empty.setVisibility(adapter.rows.isEmpty() ? View.VISIBLE : View.GONE);
         empty.setText(!log.isEmpty() ? "No sound events in the retained log. Turn off Events only to see all messages."
-                : connected ? "Connected. Waiting for receiver data…" : "Ready when you are. Connect your receiver by USB.");
+                : connected ? "Connected and subscribed. Quiet is normal; waiting for sound events…" : "Ready when you are. Connect your SoundMeter over Bluetooth.");
         if (autoScroll.isChecked() && !adapter.rows.isEmpty()) terminal.setSelection(adapter.rows.size() - 1);
         else terminal.setSelectionFromTop(index, offset);
     }
@@ -370,6 +382,14 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == ENABLE_BLUETOOTH) {
+            boolean requested = enablingBluetooth;
+            enablingBluetooth = false;
+            updateState();
+            if (result == RESULT_OK && requested && foreground) connectBle();
+            else notice.setText("Bluetooth is off. Turn it on and tap Connect SoundMeter.");
+            return;
+        }
         if (request != EXPORT) return;
         String snapshot = exportSnapshot;
         exportSnapshot = null;
@@ -396,22 +416,12 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
         });
     }
 
-    private void cancelPermissionIntent() {
-        if (permissionIntent != null) permissionIntent.cancel();
-        permissionIntent = null;
-    }
-    private void cancelPermission() {
-        waitingPermission = false; pendingPort = null;
-        cancelPermissionIntent(); updateState();
-    }
-
     @Override protected void onStop() {
         super.onStop();
-        // The system document picker is part of the export flow; keep receiving during it.
-        if (!exporting && !isChangingConfigurations()) {
-            if (picker != null) picker.dismiss();
-            cancelPermission();
-            disconnect("Monitoring paused because the app left the screen. Tap Connect receiver to resume.");
+        foreground = false;
+        // Runtime permission / Bluetooth enable dialogs and the document picker belong to this flow.
+        if (!exporting && !waitingPermission && !enablingBluetooth && !isChangingConfigurations()) {
+            disconnect("Monitoring paused because the app left the screen. Tap Connect SoundMeter to resume.");
             tone.mute();
         }
     }
@@ -425,7 +435,6 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
     @Override protected void onDestroy() {
         destroyed = true;
         unregisterReceiver(receiver);
-        cancelPermissionIntent();
         connection.destroy();
         main.removeCallbacksAndMessages(null);
         files.shutdown(); tone.release();
@@ -452,7 +461,7 @@ public final class MainActivity extends Activity implements UsbConnection.Listen
             ((TextView) row.getChildAt(0)).setText(clock.format(entry.time()));
             TextView message = (TextView) row.getChildAt(1);
             message.setText(entry.text());
-            message.setTextColor(entry.isEvent() ? TEAL : ReceiverProtocol.isWarning(entry.text()) ? ORANGE : TEXT);
+            message.setTextColor(entry.isEvent() ? TEAL : entry.warning() ? ORANGE : TEXT);
             row.setBackgroundColor(entry.isEvent() ? 0xff142e2e : 0xff0c151c);
             return row;
         }

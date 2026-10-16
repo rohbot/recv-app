@@ -4,48 +4,46 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class ReceiverProtocolTest {
-    static final String EVENT = "SOUND EVENT from aa:bb:cc:dd:ee:ff #42 level=-23.4 dBFS floor=-60.1 dBFS rise=36.7 dB duration=80 ms uptime=123456 ms";
-
-    @Test public void parsesAllEventFields() {
-        ReceiverProtocol.Message message = ReceiverProtocol.parse(EVENT);
-        assertNotNull(message);
-        assertTrue(message.event());
-        assertEquals("AA:BB:CC:DD:EE:FF", message.mac());
-        assertEquals(42, message.sequence());
-        assertEquals(-23.4, message.level(), 0.0001);
-        assertEquals(-60.1, message.floor(), 0.0001);
-        assertEquals(36.7, message.rise(), 0.0001);
-        assertEquals(80, message.duration());
-        assertEquals(123456, message.uptime());
+    @Test public void referenceVectorMatchesFirmware() {
+        byte[] bytes = {1,1,0x40,0,0x78,0x56,0x34,0x12,1,0,0,0,0x10,0x27,0,0,0x60,(byte)0xf0,(byte)0x90,(byte)0xe8};
+        ReceiverProtocol.Message event = ReceiverProtocol.decode(bytes);
+        assertEquals("0101400078563412010000001027000060f090e8", ReceiverProtocol.hex(bytes));
+        assertEquals(305419896L, event.bootId());
+        assertEquals(1, event.sequence()); assertEquals(10000, event.uptime()); assertEquals(64, event.duration());
+        assertEquals(-40, event.level(), 0); assertEquals(-60, event.floor(), 0); assertEquals(20, event.rise(), 0);
     }
-
-    @Test public void heartbeatIsNotAnEvent() {
-        ReceiverProtocol.Message message = ReceiverProtocol.parse("ESP-NOW receiver 01:23:45:67:89:ab, channel 6");
-        assertFalse(message.event());
-        assertEquals("01:23:45:67:89:AB", message.mac());
-        assertEquals(6, message.channel());
+    @Test public void initialSnapshotIsSentinelNotMeasurement() {
+        ReceiverProtocol.Message m = ReceiverProtocol.decode(BleFixtures.sentinel(0));
+        assertFalse(m.event()); assertEquals(0, m.sequence()); assertEquals(0, m.bootId());
+        assertEquals(-120, m.level(), 0);
     }
-
-    @Test public void supportsCaseInsensitiveAndIntegerMeasurements() {
-        ReceiverProtocol.Message message = ReceiverProtocol.parse(EVENT.toLowerCase().replace("-23.4", "0").replace("36.7", "-2"));
-        assertTrue(message.event());
-        assertEquals(0, message.level(), 0);
-        assertEquals(-2, message.rise(), 0);
+    @Test public void unsignedCountersAndSaturatedDurationStayPositive() {
+        ReceiverProtocol.Message m = ReceiverProtocol.decode(BleFixtures.value(1, 0xffffffffL, 0xffffffffL, 0xffffffffL, 65535, 0, -12000));
+        assertEquals(4294967295L, m.bootId()); assertEquals(4294967295L, m.sequence()); assertEquals(4294967295L, m.uptime());
+        assertEquals(65535, m.duration()); assertEquals(120, m.rise(), 0);
     }
-
-    @Test public void preservesUnrecognizedAndMalformedInputAsRawMessages() {
-        for (String line : new String[]{"", "ESP-ROM:esp32s3", EVENT + " extra", EVENT.replace("aa:bb", "invalid"),
-                EVENT.replace("-23.4", "NaN"), EVENT.replace("#42", "#9999999999999999999999999"),
-                EVENT.replace("36.7", "9".repeat(400)), "E (12) startup error"}) {
-            assertNull(line, ReceiverProtocol.parse(line));
+    @Test public void signedRiseAndHundredthsArePreserved() {
+        ReceiverProtocol.Message m = ReceiverProtocol.decode(BleFixtures.value(1, 0, 1, 0, 1, -1234, -1001));
+        assertEquals(-12.34, m.level(), 0.000001); assertEquals(-2.33, m.rise(), 0.000001);
+    }
+    @Test public void rejectsEveryWrongLength() {
+        for (int size : new int[]{0,1,19,21,40}) assertThrows(IllegalArgumentException.class, () -> ReceiverProtocol.decode(new byte[size]));
+        assertThrows(IllegalArgumentException.class, () -> ReceiverProtocol.decode(null));
+    }
+    @Test public void rejectsUnsupportedVersionAndType() {
+        for (int offset : new int[]{0,1}) {
+            byte[] bytes = BleFixtures.event(1,1); bytes[offset] = 2;
+            assertTrue(assertThrows(IllegalArgumentException.class, () -> ReceiverProtocol.decode(bytes)).getMessage().contains("Unsupported protocol"));
         }
-        assertTrue(ReceiverProtocol.isWarning("E (12) driver failed"));
-        assertFalse(ReceiverProtocol.isWarning("Boot complete"));
     }
-
-    @Test public void unsignedFirmwareCountersFitInLong() {
-        ReceiverProtocol.Message message = ReceiverProtocol.parse(EVENT.replace("#42", "#4294967295").replace("123456", "4294967295"));
-        assertEquals(4294967295L, message.sequence());
-        assertEquals(4294967295L, message.uptime());
+    @Test public void rejectsInvalidTypeSequenceCombinations() {
+        assertThrows(IllegalArgumentException.class, () -> ReceiverProtocol.decode(BleFixtures.value(0,0,1,0,0,-12000,-12000)));
+        assertThrows(IllegalArgumentException.class, () -> ReceiverProtocol.decode(BleFixtures.event(0,0)));
+    }
+    @Test public void rejectsOutOfRangeLevels() {
+        for (int level : new int[]{-12001,1,32767,-32768}) {
+            assertThrows(IllegalArgumentException.class, () -> ReceiverProtocol.decode(BleFixtures.value(1,1,1,0,0,level,-6000)));
+            assertThrows(IllegalArgumentException.class, () -> ReceiverProtocol.decode(BleFixtures.value(1,1,1,0,0,-4000,level)));
+        }
     }
 }
